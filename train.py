@@ -22,7 +22,10 @@ from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
 from functools import partial
+from pathlib import Path
 
+import h5py
+import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.utils
@@ -38,26 +41,12 @@ from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
 from timm.utils import ApexScaler, NativeScaler
 
-try:
-    from apex import amp
-    from apex.parallel import DistributedDataParallel as ApexDDP
-    from apex.parallel import convert_syncbn_model
-    has_apex = True
-except ImportError:
-    has_apex = False
-
 has_native_amp = False
 try:
     if getattr(torch.cuda.amp, 'autocast') is not None:
         has_native_amp = True
 except AttributeError:
     pass
-
-try:
-    import wandb
-    has_wandb = True
-except ImportError:
-    has_wandb = False
 
 try:
     from functorch.compile import memory_efficient_fusion
@@ -96,6 +85,7 @@ group.add_argument('--dataset-download', action='store_true', default=False,
                    help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
 group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
                    help='path to class to idx mapping file (default: "")')
+parser.add_argument('--per-example-datafile-path', action='store', required=True, type=str)
 
 # Model parameters
 group = parser.add_argument_group('Model parameters')
@@ -580,6 +570,17 @@ def main():
         download=args.dataset_download,
         batch_size=args.batch_size,
     )
+    dataset_train_noaug = create_dataset(
+        args.dataset,
+        root=args.data_dir,
+        split=args.train_split,
+        is_training=False,
+        class_map=args.class_map,
+        download=args.dataset_download,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        repeats=args.epoch_repeats
+    )
 
     # setup mixup / cutmix
     collate_fn = None
@@ -656,6 +657,21 @@ def main():
         std=data_config['std'],
         num_workers=eval_workers,
         distributed=args.distributed,
+        crop_pct=data_config['crop_pct'],
+        pin_memory=args.pin_mem,
+        device=device,
+    )
+    loader_train_noaug = create_loader(
+        dataset_train_noaug,
+        input_size=data_config['input_size'],
+        batch_size=args.validation_batch_size or args.batch_size,
+        is_training=False,
+        use_prefetcher=args.prefetcher,
+        interpolation=data_config['interpolation'],
+        mean=data_config['mean'],
+        std=data_config['std'],
+        num_workers=eval_workers,
+        distributed=False,
         crop_pct=data_config['crop_pct'],
         pin_memory=args.pin_mem,
         device=device,
@@ -744,6 +760,12 @@ def main():
             f'Scheduled epochs: {num_epochs}. LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
 
     try:
+        if utils.is_primary(args):
+            with h5py.File(args.per_example_datafile_path, 'w') as database_file:
+                database_file.create_dataset('per_example_loss', (num_epochs, len(loader_train_noaug.dataset)), dtype=np.float32)
+        if args.distributed:
+            torch.distributed.barrier()
+
         for epoch in range(start_epoch, num_epochs):
             if hasattr(dataset_train, 'set_epoch'):
                 dataset_train.set_epoch(epoch)
@@ -778,6 +800,19 @@ def main():
                 args,
                 amp_autocast=amp_autocast,
             )
+
+            if utils.is_primary(args):
+                per_example_loss = compute_per_example_loss(
+                    model,
+                    loader_train_noaug,
+                    args,
+                    amp_autocast=amp_autocast
+                )
+                with h5py.File(args.per_example_datafile_path, mode='r+') as database_file:
+                    dataset = database_file['per_example_loss']
+                    dataset[epoch, :] = per_example_loss
+            if args.distributed:
+                torch.distributed.barrier()
 
             if model_ema is not None and not args.model_ema_force_cpu:
                 if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -947,6 +982,33 @@ def train_one_epoch(
 
     return OrderedDict([('loss', losses_m.avg)])
 
+
+def compute_per_example_loss(
+        model,
+        loader,
+        args,
+        device=torch.device('cuda'),
+        amp_autocast=suppress,
+):
+    per_example_losses = list()
+    model.eval()
+    with torch.inference_mode():
+        for batch_idx, (input, target) in enumerate(loader):
+            if not args.prefetcher:
+                input = input.to(device)
+                target = target.to(device)
+            if args.channels_last:
+                input = input.contiguous(memory_format=torch.channels_last)
+            with amp_autocast():
+                output = model(input)
+                if isinstance(output, (tuple, list)):
+                    output = output[0]
+                loss = nn.functional.cross_entropy(output, target, reduction='none')
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            per_example_losses.append(loss.cpu())
+    per_example_losses = torch.cat(per_example_losses).numpy()
+    return per_example_losses
 
 def validate(
         model,
