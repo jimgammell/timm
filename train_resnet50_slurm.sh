@@ -5,7 +5,7 @@
 #SBATCH --account=cocosys
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-gpu=14
-#SBATCH --time=24:00:00
+#SBATCH --time=16:00:00
 #SBATCH --output=train-resnet50.out
 #SBATCH --error=train-resnet50.out
 

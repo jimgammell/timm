@@ -1,9 +1,9 @@
 #!/bin/bash
 
-python train.py ~/datasets/imagenet/imagenet2012/ \
+python train.py "$SCRATCH/imagenet/imagenet2012/" \
     --model resnet50 \
     --epochs 90 \
-    --batch-size 256 \
+    --batch-size 1024 \
     --opt sgd \
     --momentum 0.9 \
     --weight-decay 1e-4 \
@@ -19,4 +19,6 @@ python train.py ~/datasets/imagenet/imagenet2012/ \
     --amp --amp-dtype bfloat16 \
     --output ./output \
     --experiment resnet50_imagenet_90ep \
+    --workers=14 \
+    --pin-mem \
     --per-example-datafile-path ./output/per_example_losses.h5
